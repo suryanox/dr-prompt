@@ -2,3 +2,6 @@ fastapi
 uvicorn
 openai
 pydantic
+spacy
+sentence-transformers
+scikit-learn

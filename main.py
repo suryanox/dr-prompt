@@ -1,16 +1,20 @@
+import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncOpenAI
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import spacy
 import re
 
 app = FastAPI(title="DrPrompt", description="A doctor for your system prompts.")
-client = OpenAI()
+client = AsyncOpenAI()
 
 nlp = spacy.load("en_core_web_sm")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+REDUNDANCY_THRESHOLD = 0.72
+MODEL = "gpt-5.4"
 
 HEDGE_PATTERNS = [
     r"\btry to\b", r"\bfeel free to\b", r"\bas needed\b", r"\bwhere relevant\b",
@@ -68,11 +72,14 @@ class RedundancyReport(BaseModel):
     redundancy_percent: int
 
 
-class LLMAnalysis(BaseModel):
+class ContradictionAnalysis(BaseModel):
     contradictions: list[Contradiction]
+    one_line_summary: str
+
+
+class AmbiguityAnalysis(BaseModel):
     ambiguous_phrases: list[AmbiguousPhrase]
     coverage_gaps: list[CoverageGap]
-    one_line_summary: str
 
 
 class AnalysisResponse(BaseModel):
@@ -86,13 +93,15 @@ class AnalysisResponse(BaseModel):
     coverage_gaps: list[CoverageGap]
 
 
-def split_sentences(text: str) -> list[str]:
-    doc = nlp(text)
+def parse_doc(text: str):
+    return nlp(text)
+
+
+def split_sentences(doc) -> list[str]:
     return [sent.text.strip() for sent in doc.sents if len(sent.text.split()) > 2]
 
 
-def count_instructions(text: str) -> int:
-    doc = nlp(text)
+def count_instructions(doc) -> int:
     count = 0
     for sent in doc.sents:
         for token in sent:
@@ -103,7 +112,7 @@ def count_instructions(text: str) -> int:
                 ):
                     count += 1
                     break
-    return max(count, len(list(doc.sents)))
+    return count if count > 0 else len(list(doc.sents))
 
 
 def detect_passive_voice(doc) -> int:
@@ -120,10 +129,8 @@ def detect_hedge_phrases(text: str) -> list[str]:
     return list(set(w.lower() for w in found))
 
 
-def clarity_score(text: str) -> ClarityReport:
-    doc = nlp(text)
+def clarity_score(doc, text: str) -> ClarityReport:
     sentences = list(doc.sents)
-
     avg_len = sum(len(s.text.split()) for s in sentences) / max(len(sentences), 1)
     passive_count = detect_passive_voice(doc)
     hedge_phrases = detect_hedge_phrases(text)
@@ -145,8 +152,8 @@ def clarity_score(text: str) -> ClarityReport:
     )
 
 
-def redundancy_score(text: str) -> RedundancyReport:
-    sentences = split_sentences(text)
+def redundancy_score(doc) -> RedundancyReport:
+    sentences = split_sentences(doc)
     if len(sentences) < 2:
         return RedundancyReport(score=100, redundant_pairs=[], redundancy_percent=0)
 
@@ -157,7 +164,7 @@ def redundancy_score(text: str) -> RedundancyReport:
     for i in range(len(sentences)):
         for j in range(i + 1, len(sentences)):
             sim = float(sim_matrix[i][j])
-            if sim > 0.82:
+            if sim > REDUNDANCY_THRESHOLD:
                 redundant_pairs.append(RedundantPair(
                     sentence_1=sentences[i],
                     sentence_2=sentences[j],
@@ -174,9 +181,9 @@ def redundancy_score(text: str) -> RedundancyReport:
     )
 
 
-def llm_analysis(system_prompt: str) -> LLMAnalysis:
-    contradiction_response = client.beta.chat.completions.parse(
-        model="gpt-5.4",
+async def fetch_contradictions(system_prompt: str) -> ContradictionAnalysis:
+    response = await client.beta.chat.completions.parse(
+        model=MODEL,
         messages=[
             {
                 "role": "system",
@@ -190,12 +197,15 @@ def llm_analysis(system_prompt: str) -> LLMAnalysis:
                 ),
             },
         ],
-        response_format=LLMAnalysis,
+        response_format=ContradictionAnalysis,
         temperature=0.1,
     )
+    return response.choices[0].message.parsed
 
-    ambiguity_response = client.beta.chat.completions.parse(
-        model="gpt-5.4",
+
+async def fetch_ambiguity(system_prompt: str) -> AmbiguityAnalysis:
+    response = await client.beta.chat.completions.parse(
+        model=MODEL,
         messages=[
             {
                 "role": "system",
@@ -206,39 +216,43 @@ def llm_analysis(system_prompt: str) -> LLMAnalysis:
                 "content": (
                     f"Analyze this system prompt for:\n"
                     f"1. Ambiguous phrases that could be interpreted in multiple ways\n"
-                    f"2. User situations or edge cases this prompt does NOT handle\n"
-                    f"3. A one-line summary of what this prompt does\n\n"
+                    f"2. User situations or edge cases this prompt does NOT handle\n\n"
                     f"System prompt:\n{system_prompt}"
                 ),
             },
         ],
-        response_format=LLMAnalysis,
+        response_format=AmbiguityAnalysis,
         temperature=0.1,
     )
+    return response.choices[0].message.parsed
 
-    contradictions = contradiction_response.choices[0].message.parsed.contradictions
-    ambiguous_phrases = ambiguity_response.choices[0].message.parsed.ambiguous_phrases
-    coverage_gaps = ambiguity_response.choices[0].message.parsed.coverage_gaps
-    summary = ambiguity_response.choices[0].message.parsed.one_line_summary
 
-    return LLMAnalysis(
-        contradictions=contradictions,
-        ambiguous_phrases=ambiguous_phrases,
-        coverage_gaps=coverage_gaps,
-        one_line_summary=summary,
+async def fetch_summary(system_prompt: str) -> str:
+    response = await client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Summarize in one sentence what this system prompt is trying to do:\n\n{system_prompt}",
+            }
+        ],
+        temperature=0.1,
     )
+    return response.choices[0].message.content.strip()
 
 
 def compute_overall_score(
     clarity: ClarityReport,
     redundancy: RedundancyReport,
-    llm: LLMAnalysis,
+    contradictions: list,
+    ambiguous_phrases: list,
+    coverage_gaps: list,
     instruction_count: int,
 ) -> int:
-    contradiction_penalty = len(llm.contradictions) * 10
-    ambiguity_penalty = len(llm.ambiguous_phrases) * 5
-    gap_penalty = len(llm.coverage_gaps) * 4
-    density_penalty = max(0, instruction_count - 15) * 1.5
+    contradiction_penalty = len(contradictions) * 8
+    ambiguity_penalty = min(len(ambiguous_phrases) * 2, 20)
+    gap_penalty = min(len(coverage_gaps) * 2, 20)
+    density_penalty = max(0, instruction_count - 15) * 1.0
 
     base = clarity.score * 0.4 + redundancy.score * 0.3 + 70 * 0.3
     final = max(0, min(100, round(
@@ -248,30 +262,52 @@ def compute_overall_score(
 
 
 @app.post("/analyze", response_model=AnalysisResponse)
-def analyze(request: PromptRequest):
+async def analyze(request: PromptRequest):
     if not request.system_prompt.strip():
         raise HTTPException(status_code=400, detail="system_prompt cannot be empty")
 
     try:
-        clarity = clarity_score(request.system_prompt)
-        redundancy = redundancy_score(request.system_prompt)
-        llm = llm_analysis(request.system_prompt)
-        instruction_count = count_instructions(request.system_prompt)
-        overall = compute_overall_score(clarity, redundancy, llm, instruction_count)
+        doc = parse_doc(request.system_prompt)
+
+        clarity = clarity_score(doc, request.system_prompt)
+        redundancy = redundancy_score(doc)
+        instruction_count = count_instructions(doc)
+
+        contradictions_result, ambiguity_result, summary = await asyncio.gather(
+            fetch_contradictions(request.system_prompt),
+            fetch_ambiguity(request.system_prompt),
+            fetch_summary(request.system_prompt),
+        )
+
+        overall = compute_overall_score(
+            clarity,
+            redundancy,
+            contradictions_result.contradictions,
+            ambiguity_result.ambiguous_phrases,
+            ambiguity_result.coverage_gaps,
+            instruction_count,
+        )
 
         return AnalysisResponse(
             overall_score=overall,
-            summary=llm.one_line_summary,
+            summary=summary,
             instruction_count=instruction_count,
             clarity=clarity,
             redundancy=redundancy,
-            contradictions=llm.contradictions,
-            ambiguous_phrases=llm.ambiguous_phrases,
-            coverage_gaps=llm.coverage_gaps,
+            contradictions=contradictions_result.contradictions,
+            ambiguous_phrases=ambiguity_result.ambiguous_phrases,
+            coverage_gaps=ambiguity_result.coverage_gaps,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

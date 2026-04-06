@@ -336,7 +336,6 @@ async def fetch_summary(system_prompt: str) -> str:
                 "content": f"Summarize in one sentence what this system prompt is trying to do:\n\n{system_prompt}",
             }
         ],
-        max_tokens=80,
         temperature=0.1,
     )
     return response.choices[0].message.content.strip()
@@ -412,12 +411,6 @@ async def analyze(request: PromptRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
 
 if __name__ == "__main__":
     import uvicorn

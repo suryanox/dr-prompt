@@ -30,6 +30,14 @@ WEAK_MODALS = re.compile(
     re.IGNORECASE,
 )
 
+GRADE_MAP = [
+    (90, "A", "Excellent"),
+    (80, "B", "Good"),
+    (70, "C", "Needs Work"),
+    (50, "D", "Poor"),
+    (0,  "F", "Critical"),
+]
+
 
 class PromptRequest(BaseModel):
     system_prompt: str
@@ -45,17 +53,34 @@ class Contradiction(BaseModel):
     sentence_1: str
     sentence_2: str
     reason: str
+    severity: str
 
 
 class AmbiguousPhrase(BaseModel):
     phrase: str
     reason: str
     suggestion: str
+    rewrite: str
+    severity: str
 
 
 class CoverageGap(BaseModel):
     gap: str
     example: str
+    impact: str
+
+
+class QuickFix(BaseModel):
+    issue: str
+    fix: str
+    category: str
+
+
+class TopIssue(BaseModel):
+    title: str
+    description: str
+    severity: str
+    category: str
 
 
 class ClarityReport(BaseModel):
@@ -72,9 +97,16 @@ class RedundancyReport(BaseModel):
     redundancy_percent: int
 
 
+class PromptStats(BaseModel):
+    word_count: int
+    sentence_count: int
+    instruction_count: int
+    avg_words_per_sentence: float
+    estimated_tokens: int
+
+
 class ContradictionAnalysis(BaseModel):
     contradictions: list[Contradiction]
-    one_line_summary: str
 
 
 class AmbiguityAnalysis(BaseModel):
@@ -82,15 +114,31 @@ class AmbiguityAnalysis(BaseModel):
     coverage_gaps: list[CoverageGap]
 
 
+class QuickFixAnalysis(BaseModel):
+    quick_fixes: list[QuickFix]
+    top_issues: list[TopIssue]
+
+
 class AnalysisResponse(BaseModel):
     overall_score: int
+    grade: str
+    verdict: str
     summary: str
-    instruction_count: int
+    stats: PromptStats
+    top_issues: list[TopIssue]
+    quick_fixes: list[QuickFix]
     clarity: ClarityReport
     redundancy: RedundancyReport
     contradictions: list[Contradiction]
     ambiguous_phrases: list[AmbiguousPhrase]
     coverage_gaps: list[CoverageGap]
+
+
+def get_grade(score: int) -> tuple[str, str]:
+    for threshold, grade, verdict in GRADE_MAP:
+        if score >= threshold:
+            return grade, verdict
+    return "F", "Critical"
 
 
 def parse_doc(text: str):
@@ -99,6 +147,23 @@ def parse_doc(text: str):
 
 def split_sentences(doc) -> list[str]:
     return [sent.text.strip() for sent in doc.sents if len(sent.text.split()) > 2]
+
+
+def compute_stats(doc, text: str, instruction_count: int) -> PromptStats:
+    sentences = list(doc.sents)
+    words = text.split()
+    sentence_count = len(sentences)
+    word_count = len(words)
+    avg_words = round(word_count / max(sentence_count, 1), 1)
+    estimated_tokens = round(len(text) / 4)
+
+    return PromptStats(
+        word_count=word_count,
+        sentence_count=sentence_count,
+        instruction_count=instruction_count,
+        avg_words_per_sentence=avg_words,
+        estimated_tokens=estimated_tokens,
+    )
 
 
 def count_instructions(doc) -> int:
@@ -187,14 +252,15 @@ async def fetch_contradictions(system_prompt: str) -> ContradictionAnalysis:
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert prompt analyst. Find logical contradictions between instructions.",
+                "content": (
+                    "You are an expert prompt analyst. Find logical contradictions between instructions. "
+                    "For each contradiction assign a severity: 'high' if it will cause unpredictable behavior, "
+                    "'medium' if it causes inconsistency, 'low' if it is a minor conflict."
+                ),
             },
             {
                 "role": "user",
-                "content": (
-                    f"Find all pairs of instructions that directly contradict each other in this system prompt.\n\n"
-                    f"System prompt:\n{system_prompt}"
-                ),
+                "content": f"Find all contradictions in this system prompt:\n\n{system_prompt}",
             },
         ],
         response_format=ContradictionAnalysis,
@@ -209,19 +275,53 @@ async def fetch_ambiguity(system_prompt: str) -> AmbiguityAnalysis:
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert prompt analyst. Find ambiguous phrases and coverage gaps.",
+                "content": (
+                    "You are an expert prompt analyst. "
+                    "For ambiguous phrases: assign severity ('high', 'medium', 'low') and provide a concrete rewrite. "
+                    "For coverage gaps: assign impact ('high', 'medium', 'low') based on how likely the gap is to occur."
+                ),
             },
             {
                 "role": "user",
                 "content": (
                     f"Analyze this system prompt for:\n"
-                    f"1. Ambiguous phrases that could be interpreted in multiple ways\n"
+                    f"1. Ambiguous phrases that could be interpreted in multiple ways — include a concrete rewrite for each\n"
                     f"2. User situations or edge cases this prompt does NOT handle\n\n"
                     f"System prompt:\n{system_prompt}"
                 ),
             },
         ],
         response_format=AmbiguityAnalysis,
+        temperature=0.1,
+    )
+    return response.choices[0].message.parsed
+
+
+async def fetch_quick_fixes_and_top_issues(system_prompt: str) -> QuickFixAnalysis:
+    response = await client.beta.chat.completions.parse(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert prompt engineer. "
+                    "Identify the top 3 most impactful quick fixes and the top 3 most critical issues in a system prompt. "
+                    "Quick fixes must be concrete and immediately actionable — include the exact text to use. "
+                    "Top issues must be the single most critical problems ranked by severity."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"For this system prompt provide:\n"
+                    f"1. Top 3 quick fixes — each with the exact replacement text ready to use\n"
+                    f"2. Top 3 most critical issues — each with title, description, severity, and category\n\n"
+                    f"Categories for issues: 'clarity', 'redundancy', 'contradiction', 'ambiguity', 'coverage'\n\n"
+                    f"System prompt:\n{system_prompt}"
+                ),
+            },
+        ],
+        response_format=QuickFixAnalysis,
         temperature=0.1,
     )
     return response.choices[0].message.parsed
@@ -236,6 +336,7 @@ async def fetch_summary(system_prompt: str) -> str:
                 "content": f"Summarize in one sentence what this system prompt is trying to do:\n\n{system_prompt}",
             }
         ],
+        max_tokens=80,
         temperature=0.1,
     )
     return response.choices[0].message.content.strip()
@@ -272,10 +373,12 @@ async def analyze(request: PromptRequest):
         clarity = clarity_score(doc, request.system_prompt)
         redundancy = redundancy_score(doc)
         instruction_count = count_instructions(doc)
+        stats = compute_stats(doc, request.system_prompt, instruction_count)
 
-        contradictions_result, ambiguity_result, summary = await asyncio.gather(
+        contradictions_result, ambiguity_result, quick_fix_result, summary = await asyncio.gather(
             fetch_contradictions(request.system_prompt),
             fetch_ambiguity(request.system_prompt),
+            fetch_quick_fixes_and_top_issues(request.system_prompt),
             fetch_summary(request.system_prompt),
         )
 
@@ -288,10 +391,16 @@ async def analyze(request: PromptRequest):
             instruction_count,
         )
 
+        grade, verdict = get_grade(overall)
+
         return AnalysisResponse(
             overall_score=overall,
+            grade=grade,
+            verdict=verdict,
             summary=summary,
-            instruction_count=instruction_count,
+            stats=stats,
+            top_issues=quick_fix_result.top_issues,
+            quick_fixes=quick_fix_result.quick_fixes,
             clarity=clarity,
             redundancy=redundancy,
             contradictions=contradictions_result.contradictions,

@@ -4,10 +4,17 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+from fastapi.middleware.cors import CORSMiddleware
 import spacy
 import re
 
 app = FastAPI(title="DrPrompt", description="A doctor for your system prompts.")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 client = AsyncOpenAI()
 
 nlp = spacy.load("en_core_web_sm")

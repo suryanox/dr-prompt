@@ -30,8 +30,9 @@ run-backend:
 	@echo ""
 	@echo "📦 Installing backend dependencies..."
 	@cd backend && pip install -r requirements.txt -q
+	@python -m spacy download en_core_web_sm
 	@echo "🚀 Starting backend..."
-	@cd backend && python main.py
+	@cd backend && python main.py &
 
 run-frontend:
 	@echo ""

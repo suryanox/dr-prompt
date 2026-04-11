@@ -23,6 +23,7 @@ System prompts are the backbone of every LLM application — but most are writte
 
 ```bash
 pip install -r requirements.txt
+python -m spacy download en_core_web_sm
 ```
 
 ### 2. Set your OpenAI API key
